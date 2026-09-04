@@ -1,0 +1,19 @@
+README.md
+  s_b2152448fb9576::t_f2bb0919df238e 24,27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.43-trip",
+  "base_commit_sha": "75051ab34852df2fafd66c5ad94bde0661dca83e",
+  "prompts": {},
+  "sessions": {
+    "s_b2152448fb9576": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc39f8d0-5eec-4c55-8ac0-af183da7a8db",
+        "model": "ep-tavmzh6e"
+      },
+      "human_author": "chen_xingyu <chen_xingyu@trip.com>"
+    }
+  }
+}
