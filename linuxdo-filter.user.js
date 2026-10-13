@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LinuxDo 高级过滤器
 // @namespace    https://linux.do/
-// @version      1.5.0
-// @description  按 类别/标签/标题正则 过滤 linux.do 主题帖，支持作用域(全局/首页/类别页)、规则优先级(可调)、草稿、匹配预览、导入导出。DSL 支持 AND/OR/NOT。高亮规则独立配色，规则列表支持全规则匹配预览。
+// @version      1.5.1
+// @description  增加创建/最后回复日期规则及已访问主题过滤；按 类别/标签/标题正则 过滤 linux.do 主题帖，支持作用域(全局/首页/类别页)、规则优先级(可调)、草稿、匹配预览、导入导出。DSL 支持 AND/OR/NOT。高亮规则独立配色，规则列表支持全规则匹配预览。
 // @author       you
 // @match        https://linux.do/*
 // @run-at       document-start
@@ -16,7 +16,42 @@
 
   // ───────────────────────── 常量 ─────────────────────────
   var BUCKET_MAX = 1000;
-  var RULES_KEY = 'ldf_rules_v2';        // [{name, mode:'filter'|'highlight', status:'active'|'draft', expr, color?, scope:{type,...}}]
+  var RULES_KEY = 'ldf_date_beta_rules_v1';        // [{name, mode:'filter'|'highlight', status:'active'|'draft', expr, color?, scope:{type,...}}]
+  var VISITED_KEY = 'ldf_date_beta_visited_topics_v1';
+  var visitedIds = new Set();
+  var savedVisits = gmGet(VISITED_KEY, []);
+  if (Array.isArray(savedVisits)) savedVisits.forEach(function (id) { if (/^\d+$/.test(String(id))) visitedIds.add(String(id)); });
+  function topicIdFromUrl(url) {
+    try {
+      var u = new URL(url, location.href);
+      if (u.origin !== location.origin) return null;
+      var m = /^\/t\/(?:[^/]+\/)?(\d+)(?:\/|$)/.exec(u.pathname);
+      return m ? m[1] : null;
+    } catch (e) { return null; }
+  }
+  function recordVisit(id) {
+    if (!id || visitedIds.has(String(id))) return;
+    visitedIds.add(String(id));
+    var ids = Array.from(visitedIds);
+    if (ids.length > 20000) { ids = ids.slice(-20000); visitedIds = new Set(ids); }
+    gmSet(VISITED_KEY, ids);
+  }
+  function recordCurrentTopic() { recordVisit(topicIdFromUrl(location.href)); }
+  ['pushState', 'replaceState'].forEach(function (method) {
+    var original = history[method];
+    if (typeof original !== 'function') return;
+    history[method] = function () {
+      var result = original.apply(this, arguments);
+      recordCurrentTopic();
+      return result;
+    };
+  });
+  window.addEventListener('popstate', recordCurrentTopic);
+  document.addEventListener('click', function (event) {
+    var a = event.target && event.target.closest && event.target.closest('a[href]');
+    if (a && !event.defaultPrevented && event.button === 0 && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) recordVisit(topicIdFromUrl(a.href));
+  }, false);
+  recordCurrentTopic();
   var HOME_ROUTES = ['latest', 'new', 'unseen', 'hot', 'top', 'read'];
   var HL_PALETTE = ['#ffb000', '#1971c2', '#2f9e44', '#e03131', '#9c36b5', '#f76707', '#0c8599', '#66a80f']; // 高亮自动配色（首色为原琥珀色）
 
@@ -142,7 +177,7 @@
       if (w.length) {
         var up = w.toUpperCase();
         if (up === 'AND' || up === 'OR' || up === 'NOT') tokens.push({ t: up });
-        else if (w.toLowerCase() === 'category' || w.toLowerCase() === 'tag' || w.toLowerCase() === 'title') tokens.push({ t: 'atom', v: w.toLowerCase() });
+        else if (/^(category|tag|title|createdwithin|lastpostedwithin|createdbefore|createdafter|lastpostedbefore|lastpostedafter|createdbetween|lastpostedbetween|visited)$/i.test(w)) tokens.push({ t: 'atom', v: w.toLowerCase() });
         else tokens.push({ t: 'word', v: w });
         continue;
       }
@@ -188,6 +223,8 @@
       if (tk.v === 'category') return this.parseCategoryArgs();
       if (tk.v === 'tag') return this.parseTagArgs();
       if (tk.v === 'title') return this.parseTitleArg();
+      if (tk.v === 'visited') { this.expect(')'); return { op: 'visited' }; }
+      if (/^(createdwithin|lastpostedwithin|createdbefore|createdafter|lastpostedbefore|lastpostedafter|createdbetween|lastpostedbetween)$/.test(tk.v)) return this.parseDateArgs(tk.v);
       throw new Error('未知原子：' + tk.v);
     }
     throw new Error('意外的 token：' + tk.t);
@@ -228,6 +265,20 @@
     if (tk.t === 'str' || tk.t === 'word') { this.expect(')'); return { op: 'title', literal: tk.v }; }
     throw new Error('title() 参数应为正则或字符串');
   };
+  Parser.prototype.parseDateArgs = function (op) {
+    var args = this.parseNameList(); this.expect(')');
+    var expected = /between$/.test(op) ? 2 : 1;
+    if (args.length !== expected) throw new Error(op + '() 需要 ' + expected + ' 个参数');
+    if (/within$/.test(op)) {
+      var match = /^(\d+)(h|d|w|mo)$/i.exec(args[0]);
+      if (!match || Number(match[1]) <= 0) throw new Error('时间跨度应为正整数加 h/d/w/mo，如 7d');
+      return { op: 'date', field: /^created/.test(op) ? 'created_at' : 'last_posted_at', kind: 'within', duration: Number(match[1]) * ({h:3600000,d:86400000,w:604800000,mo:2592000000})[match[2].toLowerCase()] };
+    }
+    args.forEach(function (value) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(Date.parse(value + 'T00:00:00Z')) || new Date(value + 'T00:00:00Z').toISOString().slice(0,10) !== value) throw new Error('日期格式应为有效的 YYYY-MM-DD');
+    });
+    return { op: 'date', field: /^created/.test(op) ? 'created_at' : 'last_posted_at', kind: /between$/.test(op) ? 'between' : /before$/.test(op) ? 'before' : 'after', dates: args };
+  };
   function parseDSL(src) { return new Parser(tokenize(src)).parse(); }
 
   // ───────────────────────── DSL：编译为谓词 ─────────────────────────
@@ -237,6 +288,7 @@
       case 'OR': { var l = compile(node.l), r = compile(node.r); return function (t) { return l(t) || r(t); }; }
       case 'AND': { var la = compile(node.l), ra = compile(node.r); return function (t) { return la(t) && ra(t); }; }
       case 'NOT': { var v = compile(node.v); return function (t) { return !v(t); }; }
+      case 'visited': return function (t) { return !!t && t.id != null && visitedIds.has(String(t.id)); };
       case 'category': {
         var ids = resolveCategoryIds(node.name, node.levels);
         return function (t) { return ids.has(t.category_id); };
@@ -244,6 +296,20 @@
       case 'tag': {
         var set = new Set(node.names.map(function (s) { return (s || '').toLowerCase(); }));
         return function (t) { return !!(t.tags && t.tags.some(function (x) { return set.has((x.name || '').toLowerCase()); })); };
+      }
+      case 'date': {
+        var start = node.dates && Date.parse(node.dates[0] + 'T00:00:00Z');
+        var end = node.dates && node.dates[1] && Date.parse(node.dates[1] + 'T00:00:00Z') + 86400000;
+        return function (t) {
+          var raw = t && t[node.field];
+          if (typeof raw !== 'string') return false;
+          var time = Date.parse(raw);
+          if (!Number.isFinite(time)) return false;
+          if (node.kind === 'within') { var now = Date.now(); return time <= now && time >= now - node.duration; }
+          if (node.kind === 'before') return time < start;
+          if (node.kind === 'after') return time >= start;
+          return time >= start && time < end;
+        };
       }
       case 'title': {
         var re = ('regex' in node) ? new RegExp(node.regex, node.flags || '') : new RegExp(escapeRe(node.literal || ''), 'i');
@@ -307,8 +373,29 @@
     return false;
   }
 
+  // 仅在首次安装测试版且没有已保存规则时，写入示例规则；不会覆盖用户编辑。
+  function ensureDemoRules() {
+    var existing = gmGet(RULES_KEY, null);
+    var scope = { type: 'global' };
+    var defaults = [
+      { name: '匹配开源项目', mode: 'highlight', status: 'draft', expr: 'title(/开源|教程/) OR tag(开源推广)', scope: scope },
+      { name: '过滤广告', mode: 'filter', status: 'draft', expr: '(category(搞七捻三, 0) AND tag(纯水, 病友, 树洞, 职场) OR tag(高级推广) OR category(前沿快讯, 0) OR title(/公益推广|\\?|？|吗|麻烦|请|什么|如何|哪个|怎么|求|吃瓜|还是|为什么|求助/)) AND NOT title(开源)', scope: scope },
+      { name: '匹配福利贴', mode: 'highlight', status: 'draft', expr: '(category(福利羊毛, 1, 2, 3) OR title("羊毛")) AND NOT title(/已拉闸|已失效/)', scope: scope },
+      { name: '日期测试：隐藏超过7天的旧帖', mode: 'filter', status: 'draft', expr: 'NOT createdWithin(7d)', scope: scope },
+      { name: '日期测试：高亮24小时内回复', mode: 'highlight', status: 'draft', expr: 'lastPostedWithin(24h)', scope: scope },
+      { name: '隐藏已访问主题', mode: 'filter', status: 'draft', expr: 'visited()', scope: scope }
+    ];
+    var rules = Array.isArray(existing) ? existing : [];
+    var changed = !Array.isArray(existing);
+    defaults.forEach(function (rule) {
+      if (!rules.some(function (r) { return r.name === rule.name; })) { rules.push(rule); changed = true; }
+    });
+    if (changed) gmSet(RULES_KEY, rules);
+  }
+
   // ───────────────────────── 规则引擎 ─────────────────────────
   function reloadRules() {
+    ensureDemoRules();
     var raw = gmGet(RULES_KEY, []);
     if (!Array.isArray(raw)) raw = [];
     state.rules = raw;
@@ -324,7 +411,7 @@
         var ast = parseDSL(r.expr || '');
         if (!state.catMap) ensureCatMapFallback();
         var fn = compile(ast);
-        var entry = { name: r.name, fn: fn, scope: r.scope || { type: 'global' } };
+        var entry = { name: r.name, expr: r.expr || '', fn: fn, scope: r.scope || { type: 'global' } };
         if (r.mode === 'highlight') { entry.color = hlColor; state.highlightPredicates.push(entry); }
         else state.filterPredicates.push(entry);
       } catch (e) { /* 编译错误静默，编辑器会显示 */ }
@@ -398,6 +485,13 @@
   function splitTopics(topics, pg) {
     var highlighted = [], kept = [], filtered = [], hlColors = new Map();
     (topics || []).forEach(function (t) {
+      // 已访问过滤规则优先于高亮；其他规则的优先级保持不变。
+      var visitedFiltered = state.filterPredicates.some(function (r) {
+        if (!/\bvisited\s*\(/i.test(r.expr)) return false;
+        if (!ruleAppliesToPage(r, pg)) return false;
+        try { return r.fn(t); } catch (e) { return false; }
+      });
+      if (visitedFiltered) { filtered.push(t); return; }
       var rank = highlightRank(t, pg);
       if (rank >= 0) { t.__ldfRank = rank; highlighted.push(t); hlColors.set(t.id, state.highlightPredicates[rank].color); }
       else if (isFiltered(t, pg)) filtered.push(t);
@@ -766,7 +860,7 @@
       });
     }
     box.innerHTML =
-      '<div class="ldf-modal-header"><div class="ldf-modal-titles"><div class="ldf-modal-title">高级过滤器</div><div class="ldf-modal-sub">管理过滤 / 高亮规则</div></div><span class="ldf-close-icon" data-act="close" title="关闭">✕</span></div>'
+      '<div class="ldf-modal-header"><div class="ldf-modal-titles"><div class="ldf-modal-title">高级过滤器 · 日期测试</div><div class="ldf-modal-sub">v1.5.1-beta.6 · 管理过滤 / 高亮规则</div></div><span class="ldf-close-icon" data-act="close" title="关闭">✕</span></div>'
       + '<div class="ldf-list-toolbar">'
       + '<button id="ldf-add" class="btn btn-primary ldf-btn-add">+ 新建规则</button>'
       + '<span class="ldf-toolbar-spacer"></span>'
@@ -890,12 +984,20 @@
       + '<span id="ldf-expr-status" class="ldf-expr-status"></span>'
       + '<div class="ldf-expr-help">'
       + '<div class="ldf-expr-help-title">语法说明</div>'
+      + '<div class="ldf-cat-hint">测试版 v1.5.1-beta.8：示例规则自动补齐；日期测试规则默认草稿，可在规则列表启用。时间单位：h 小时 / d 天 / w 周 / mo 30天。</div>'
       + '<div class="ldf-expr-help-grid">'
       + '<code>s1 AND (s2 OR s3) AND NOT s4</code><span>且/或/非，支持分组</span>'
       + '<code>category(名称[, 级别…])</code><span>匹配类别（级别：0/1/2/3，省略代表全部）</span>'
       + '<code>tag(标签1, 标签2, …)</code><span>匹配任一标签</span>'
       + '<code>title("文本")</code><span>标题包含文本</span>'
       + '<code>title(/正则/标志)</code><span>标题正则匹配</span>'
+      + '<code>createdWithin(7d)</code><span>首次发布在最近 7 天内；支持 h/d/w/mo</span>'
+      + '<code>lastPostedWithin(24h)</code><span>最后回复在最近 24 小时内</span>'
+      + '<code>visited()</code><span>本机曾经打开过的主题（从安装此版本开始记录；不要求读完）</span>'
+      + '<code>createdBefore("2026-10-01")</code><span>首次发布早于指定日期（UTC）</span>'
+      + '<code>createdAfter("2026-10-01")</code><span>首次发布不早于指定日期（UTC）</span>'
+      + '<code>createdBetween("2026-10-01","2026-10-13")</code><span>首次发布时间区间（含两端日期，UTC）</span>'
+      + '<code>lastPostedBefore/After/Between(...)</code><span>最后回复时间对应的日期条件</span>'
       + '</div>'
       + '<div class="ldf-expr-help-eg"><div>复杂示例：匹配所有0/1级搞七捻三的帖子，或标签带有纯水且同时带有病友或树洞的帖子，但如果标题含有开源则忽略</div><code>(category(搞七捻三,0,1) OR tag(纯水) AND tag(病友,树洞)) AND NOT title(开源)</code></div>'
       + '</div>'
@@ -1280,6 +1382,7 @@
         if (!mo) return;
         var prevKey = state.currentPage ? state.currentPage.key : null;
         syncCurrentPage();
+        recordCurrentTopic();
         ensureTopBtn();
         tryRenderSelfEmpty();
         tryApplyHighlights();
